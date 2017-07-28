@@ -1,0 +1,815 @@
+<?php namespace ProcessWire;
+
+/**
+ * Login for Facebook
+ * 
+ * Developed by Ryan Cramer
+ * Made for and sponsored by Michael Barón
+ *
+ * Module configuration properties
+ * -------------------------------
+ * @property string $appID 
+ * @property string $appSecret
+ * @property bool|int $createUsers
+ * @property int $afterLoginPageID
+ * @property int $errorLoginPageID
+ * @property array $requestPermissions
+ * @property array $requestFields
+ * @property int $commonUserName
+ * @property string $userNameFormat
+ * @property array $addRoles
+ * @property array $disallowRoles
+ * @property array $disallowPermissions
+ *
+ * Module internal use properties 
+ * ------------------------------
+ * @property string $pageName
+ * @property string $templateName
+ * @property string $fieldName
+ * @property string $roleName
+ *
+ * Examples of Facebook fields available for direct access
+ * -------------------------------------------------------
+ * @property string $id 
+ * @property string $name
+ * @property string $first_name
+ * @property string $last_name
+ * @property string $email
+ * @property string $cover
+ * @property string $picture
+ * @property string $locale
+ * @property string $timezone
+ * 
+ * Runtime generated properties
+ * ----------------------------
+ * @property string $url The full http URL to the /login-facebook/ page. 
+ * @property string $cover_url URL to Facebook user’s cover image (variable size but larger than picture)
+ * @property string $picture_url URL to Facebook user’s picture image (100x100)
+ *
+ * Hookable methods 
+ * ----------------
+ * @method string execute()
+ * @method User|bool login(array $userData)
+ * @method bool allowLogin(User $user)
+ * @method User createNewUser(array $userData)
+ * @method int updateUser(User $user, array $userData)
+ * 
+ * @todo duplicate checking to avoid multiple accounts having same Facebook ID
+ *
+ * 
+ */
+
+class LoginFacebook extends WireData implements Module, ConfigurableModule {
+
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'Login for Facebook',
+			'version' => 2,
+			'summary' => 'Enables login via Facebook account and PW user creation.',
+			'requires' => 'ProcessWire>=3.0.42'
+		);
+	}
+	
+	/**
+	 * Fields that can be requested from Facebook 
+	 * 
+	 * @var array
+	 * 
+	 */
+	protected $facebookFields = array(
+		'id',
+		'about',
+		'admin_notes',
+		'age_range',
+		'birthday',
+		'can_review_measurement_request',
+		'context',
+		'cover',
+		'currency',
+		'devices',
+		'education',
+		'email',
+		'employee_number',
+		'favorite_athletes',
+		'favorite_teams',
+		'first_name',
+		'gender',
+		'hometown',
+		'inspirational_people',
+		'install_type',
+		'installed',
+		'interested_in',
+		'is_shared_login',
+		'is_verified',
+		'labels',
+		'languages',
+		'last_name',
+		'link',
+		'locale',
+		'location',
+		'meeting_for',
+		'middle_name',
+		'name',
+		'name_format',
+		'payment_pricepoints',
+		'political',
+		'picture', 
+		'public_key',
+		'quotes',
+		'relationship_status',
+		'religion',
+		'security_settings',
+		'shared_login_upgrade_required_by',
+		'short_name',
+		'significant_other',
+		'sports',
+		'test_group',
+		'third_party_id',
+		'timezone',
+		'token_for_business',
+		'updated_time',
+		'verified',
+		'video_upload_limits',
+		'viewer_can_send_gift',
+		'website',
+		'work',
+	);
+
+	/**
+	 * Construct and set config defaults
+	 * 
+	 */
+	public function __construct() {
+		
+		$this->set('appID', '');
+		$this->set('appSecret', '');
+		$this->set('createUsers', 1); 
+		$this->set('afterLoginPageID', 0);
+		$this->set('commonUserName', '');
+		$this->set('userNameFormat', 'full');
+		$this->set('addRoles', array());
+		$this->set('disallowRoles', array('superuser'));
+		$this->set('disallowPermissions', array('page-edit')); 
+		
+		$this->set('requestPermissions', array(
+			'public_profile', 
+			'email'
+		));
+		
+		$this->set('requestFields', array(
+			'id', 
+			'name',
+			'first_name',
+			'last_name',
+			'email',
+			'gender',
+			'locale',
+			'timezone',
+			'picture',
+			'cover',
+			'age_range',
+			'link',
+			'updated_time',
+			'verified',
+		));
+		
+		$name = strtolower(str_replace('Login', 'login-', $this->className()));
+		
+		$this->set('pageName', $name);
+		$this->set('roleName', $name);
+		$this->set('templateName', $name);
+		$this->set('fieldName', str_replace('-', '_', $name) . '_id'); 
+		
+		parent::__construct();
+	}
+
+	/**
+	 * Get a Facebook field for current user
+	 * 
+	 * @param string $key
+	 * @return string|int|array|Wire|mixed|null
+	 * 
+	 */
+	public function get($key) {
+		if(in_array($key, $this->facebookFields)) {
+			$requestFields = parent::get('requestFields');
+			if(!in_array($key, $requestFields)) $requestFields[] = $key;
+			$userData = $this->getUserData($requestFields);
+			return $this->prepData($userData[$key]);
+		} else if($key == 'url') {
+			$pages = $this->wire('pages');
+			$page = $pages->get("template=$this->templateName");
+			return $page->id ? $page->httpUrl() : $pages->get(1)->httpUrl() . "$this->pageName/";
+		} else if($key == 'picture_url') {
+			return $this->prepData($this->getImageURL('picture'));
+		} else if($key == 'cover_url') {
+			return $this->prepData($this->getImageURL('cover'));
+		}
+		return parent::get($key);
+	}
+
+	/**
+	 * Entity encode strings, or array containing strings (recursively) when current page has output formatting ON
+	 * 
+	 * If current page does not have output formatting on, this method just returns the value. 
+	 * 
+	 * @param string|array $value
+	 * @return array|string
+	 * 
+	 */
+	protected function prepData($value) {
+		// It appears that Facebook data may already be entity encoded
+		/*
+		if(!$this->wire('page')->of()) return $value;
+		if(is_string($value)) {
+			$value = $this->wire('sanitizer')->entities($value);
+		} else if(is_array($value)) {
+			foreach($value as $k => $v) {
+				$value[$k] = $this->prepData($v);
+			}
+		}
+		*/
+		return $value;
+	}
+
+	/**
+	 * Main program execution
+	 * 
+	 * @throws LoginFacebookException
+	 * @return bool Returns true if user is logged in (or already logged in w/Facebook) or false if not
+	 * 
+	 */
+	public function ___execute() {
+		
+		if($this->executeCheckError()) return false;
+		
+		$appID = $this->appID;
+		$appSecret = $this->appSecret;
+		$pageURL = $this->wire('page')->httpUrl();
+		
+		$session = $this->wire('session');
+		$input = $this->wire('input');
+		$user = $this->wire('user');
+		$code = $input->get('code');  // @todo $code needs a sanitizer!
+	
+		// check if user is already logged in with Facebook
+		if($this->isLoggedIn()) {
+			$this->afterLoginRedirect($user);
+			return true;
+		}
+		
+		if(empty($code)) {
+			// start a login: redirect to Facebook
+			$pass = new Password();
+			$state = $pass->randomBase64String(32, true); // csrf state
+			$session->setFor($this, 'state', $state); 
+			$redirectURL = "https://www.facebook.com/dialog/oauth" . 
+				"?client_id=$appID" . 
+				"&response_type=code" . 
+				"&scope=" . implode(',', $this->requestPermissions) . 
+				"&redirect_uri=" . urlencode($pageURL) . 
+				"&state=$state";
+			$session->redirect($redirectURL, false); 
+			return false;
+		}
+		
+		$state = $session->getFor($this, 'state');
+		
+		if(empty($state)) $this->logException("Invalid request (no Facebook state)"); 
+		if($state !== $input->get('state')) $this->logException('Facebook CSRF fail (state does not match)');
+		
+		// validated CSRF state sent back from Facebook, now obtain an access token
+
+		/** @var WireHttp $http */
+		$http = new WireHttp();
+		$data = $http->getJSON("https://graph.facebook.com/oauth/access_token", true, array(
+			'client_id' => $appID, 
+			'redirect_uri' => $pageURL, 
+			'client_secret' => $appSecret, 
+			'code' => $code
+		));
+
+		if(empty($data)) $this->logException("Failed access token request");  
+		if(empty($data['access_token'])) $this->logException("No access token provided by Facebook"); 
+	
+		// store access token and related info in session
+		$session->setFor($this, 'accessToken', $data['access_token']);
+		$session->setFor($this, 'accessTokenType', $data['token_type']);
+		$session->setFor($this, 'accessTokenExpires', time() + $data['expires_in']);
+	
+		// with access token not available, we can request user data
+		$userData = $this->getUserData();
+
+		if(empty($userData)) $this->logException("Returned facebook user data is empty"); 
+		if(empty($userData['id'])) $this->logException("Returned facebook user data has no user ID"); 
+		
+		if(!$this->login($userData)) {
+			$this->logException("Facebook to ProcessWire login failed"); 
+		}
+		
+		return true;
+	}
+
+	/**
+	 * Check for errors from Facebook and redirect to error page or throw Exception when applicable
+	 * 
+	 * This occurs for example when a user denies the Facebook permission request. 
+	 * 
+	 * Facebook sends through these GET variables: 
+	 * - error_reason=user_denied
+	 * - error=access_denied
+	 * - error_description=The+user+denied+your+request.
+	 * 
+	 * @return bool True if there were errors, false if not
+	 * @throws LoginFacebookException
+	 * 
+	 */
+	protected function executeCheckError() {
+		$input = $this->wire('input');
+		if(!$input->get('error')) return false;
+		$error = $input->get->name('error');
+		$errorReason = $input->get->name('error_reason');
+		$errorDescription = $input->get->text('error_description');
+		$errorLog = "Error: $error, Reason: $errorReason, Description: $errorDescription";
+		$this->log($errorLog);
+		if($this->errorLoginPageID) {
+			$errorLoginPage = $this->wire('pages')->get((int) $this->errorLoginPageID);
+			if($errorLoginPage->id) {
+				$errorPageURL = $errorLoginPage->httpUrl();
+				$errorPageURL .= "?error=$error&error_reason=$errorReason&error_description=" . urlencode($errorDescription);
+				$this->wire('session')->redirect($errorPageURL);
+				return true;
+			}
+		}
+		throw new LoginFacebookException($this->_('Failed to authenticate from Facebook') . " ($errorLog)");
+	}
+
+	/**
+	 * Process a facebook login
+	 * 
+	 * @param $userData
+	 * @return User|bool Returns User on success, or false if no user was able to be logged in
+	 * @throws LoginFacebookException
+	 * 
+	 */
+	protected function ___login(array $userData) {
+		
+		if(empty($userData['id'])) throw new LoginFacebookException("No facebook user ID");
+		
+		$loggedIn = $this->wire('user')->isLoggedin();
+		$session = $this->wire('session');
+		
+		/** @var User|NullPage $u */
+		if($this->commonUserName && !$this->createUsers) {
+			$u = $this->wire('users')->get("name=" . $this->wire('sanitizer')->pageName($this->commonUserName));
+		} else if(!$loggedIn) {
+			$u = $this->wire('users')->get("$this->fieldName=$userData[id]");
+		}
+		
+		if($loggedIn) {
+			// user is already logged in
+			$u = $this->wire('user');
+			$this->updateUser($u, $userData);
+			
+		} else if($u->id) {
+			// user already has a facebook login
+			$this->updateUser($u, $userData);
+			
+		} else if($this->createUsers) {
+			// new user from facebook, we will create user in PW too
+			$u = $this->createNewUser($userData);
+
+		} else {
+			// createUsers option disabled: provide new user registration form instead?
+			$this->log("No login action for $userData[name]"); 
+			return false;
+		}
+	
+		if($loggedIn) {
+			$loginUser = $u;
+			$this->log("Already logged-in user connected to Facebook account: $u->name"); 
+		} else if($this->allowLogin($u)) {
+			// force login this user
+			$loginUser = $this->wire('session')->forceLogin($u);
+			if($loginUser && $loginUser->id) {
+				$this->log("Used Facebook to login for user: $loginUser->name");
+				$session->setFor($this, 'forceLogin', true); 
+			}
+		} else {
+			$this->log("User is not allowed to login: $u->name"); 		
+			throw new LoginFacebookException($this->_('This account is not allowed to login with Facebook')); 
+		}
+		
+		if($loginUser && $loginUser->id) {
+			// if force login a success, redirect to designated page
+			$this->afterLoginRedirect($loginUser);
+			return $loginUser;
+		}
+		
+		return false;
+	}
+	
+	protected function afterLoginRedirect(User $loginUser) {
+		if($this->wire('input')->get('login') === 'facebook') return false;
+		$session = $this->wire('session');
+		$url = $session->getFor($this, 'afterLoginURL');
+		if($url) {
+			$this->log("After login redirect to $url for user: $loginUser->name");
+			$session->setFor($this, 'afterLoginURL', '');
+		} else if($this->afterLoginPageID) {
+			$pageID = $this->afterLoginPageID;
+			$page = $pageID ? $this->wire('pages')->get($pageID) : new NullPage();
+			if(!$page->id) $page = $this->wire('page');
+			$url = $page->httpUrl();
+		} else {
+			$url = $this->wire('page')->httpUrl();
+		}
+		if($url) {
+			$session->redirect($url . '?login=facebook');
+		}
+		return true;
+	}
+
+	/**
+	 * Allow this user to use Facebook login?
+	 * 
+	 * @param User $user
+	 * @return bool
+	 * 
+	 */
+	protected function ___allowLogin(User $user) {
+		
+		$allow = true;
+		$note = '';
+		
+		foreach($this->disallowRoles as $name) {
+			if($user->hasRole($name)) {
+				$allow = false;
+				$note = $name;
+				break;
+			}
+		}
+		
+		if(!$allow) {
+			$this->log("Role '$note' prevents user from login: $user->name"); 
+			return false;
+		}
+		
+		foreach($this->disallowPermissions as $name) {
+			if($user->hasPermission($name)) {
+				$allow = false;
+				$note = $name;
+				break;
+			}
+		}
+		
+		if(!$allow) {
+			$this->log("Permission '$note' prevents user from login: $user->name"); 
+		}
+		
+		return $allow;
+	}
+
+	/**
+	 * Create a new user
+	 * 
+	 * @param array $userData
+	 * @return User
+	 * 
+	 */
+	protected function ___createNewUser(array $userData) {
+		
+		switch($this->userNameFormat) {
+			case 'rfull':
+				$userName = "$userData[last_name] $userData[first_name]";
+				break;
+			case 'first':
+				$userName = "$userData[first_name]";
+				break;
+			case 'last':
+				$userName = "$userData[last_name]";
+				break;
+			default:
+				$userName = "$userData[name]";
+		}
+		
+		$userName = $this->wire('sanitizer')->pageName($userName, true);
+		$_userName = $userName;
+		$cnt = 0;
+
+		do {
+			$u = $this->wire('users')->get("name=$userName");
+			if(!$u->id) break; // success, no user matches this name, can exit loop
+			// existing user matches this name, so we need to try for another user name
+			$userName = $_userName . '-' . (++$cnt);
+			$userData['name'] = $userName;
+		} while($u->id);
+
+		// generate random password
+		$password = new Password();
+		$pass = $password->randomPass(array(
+			'minLength' => 7,
+			'maxLength' => 15,
+			'minUpper' => 1,
+			'maxUpper' => 3,
+			'minLower' => 1,
+			'minDigits' => 1,
+			'maxDigits' => 0,
+			'minSymbols' => 0,
+			'maxSymbols' => 3,
+		));
+
+		// create new user
+		$u = new User();
+		$u->name = $userName;
+		$u->set($this->fieldName, $userData['id']);
+		$u->pass = $pass;
+		$u->addRole($this->roleName);
+		if(!empty($userData['email'])) $u->set('email', $userData['email']);
+		$u->save();
+		
+		if($u->id) {
+			$this->log("Created new user: $userName"); 
+			$this->updateUser($u, $userData);
+		}
+		
+		return $u;
+	}
+
+	/**
+	 * Update a user to make it consistent with Facebook settings
+	 * 
+	 * @param User $user
+	 * @param array $userData
+	 * @return int Number of changes saved
+	 * 
+	 */
+	protected function ___updateUser(User $user, array $userData) {
+		
+		$updates = array();
+		$of = $user->of();
+		if($of) $user->of(false);
+		
+		if(!$user->hasRole($this->roleName)) {
+			$user->addRole($this->roleName);
+			$updates[] = "role:$this->roleName";
+		}
+		
+		foreach($this->addRoles as $roleName) {
+			if(!$user->hasRole($roleName)) {
+				$user->addRole($roleName);
+				$updates[] = "role:$roleName";
+			}
+		}
+
+		if($user->name === $this->commonUserName && !$this->createUsers) {
+			
+			// common account used for all Facebook logins
+			// no need to do anyting further
+			
+		} else {
+			
+			if($user->get($this->fieldName) != $userData['id']) {
+				$user->set($this->fieldName, $userData['id']);
+				$updates[] = $this->fieldName;
+			}
+
+			foreach($this->requestFields as $name) {
+				if(empty($userData[$name])) continue;
+				$value = parent::get("fb_$name");
+				if(empty($value)) continue;
+				list($fieldID, $fieldName) = explode(':', $value);
+				$field = $this->wire('fields')->get($fieldName);
+				if(!$field) $field = $this->wire('fields')->get((int) $fieldID);
+				if(!$field) continue;
+				if(!$user->template->hasField($field)) continue;
+				if($user->get($field->name) != $userData[$name]) {
+					$user->set($fieldName, $userData[$name]);
+					$updates[] = $fieldName;
+				}
+			}
+		}
+		
+		if(count($updates)) {
+			$user->save();
+			$this->log("Updated user '$user->name' fields: " . implode(', ', $updates));
+		}
+		
+		if($of) $user->of(true);
+		
+		return count($updates);
+	}
+	
+	/**
+	 * Send a request to Facebook to retrieve user data for specified fields
+	 * 
+	 * Note that the returned user data is not yet entity encoded for output. 
+	 * 
+	 * Also included are two additional properties in returned array:
+	 * - `_errors` (array): List of any error messages that occurred.
+	 * - `_cache` (bool): True if returned data was pulled from cache, false if not. 
+	 *
+	 * @param array $fieldNames Optionally specify field names you want to retrieve (default=all). 
+	 * @return array|bool Returns associative array, or boolean false on failure.
+	 * @throws LoginFacebookException
+	 *
+	 */
+	public function getUserData(array $fieldNames = array()) {
+
+		$http = new WireHttp();
+		$session = $this->wire('session');
+		$sessionData = $session->getFor($this, 'userData');
+		$accessToken = $session->getFor($this, 'accessToken');
+		$expires = (int) $session->getFor($this, 'accessTokenExpires');
+
+		if(empty($fieldNames)) {
+			$fieldNames = array_merge(array('id', 'name'), $this->requestFields);
+		} else {
+			if(!in_array('id', $fieldNames)) $fieldNames[] = 'id';
+		}
+
+		$fieldNames = array_unique($fieldNames);
+
+		// check to see if requested user data is already available in session
+		if(is_array($sessionData) && !empty($sessionData['id'])) {
+			$userData = array();
+			foreach($fieldNames as $fieldName) {
+				if(array_key_exists($fieldName, $sessionData)) {
+					$userData[$fieldName] = $sessionData[$fieldName];
+				}
+			}
+			if(count($userData) === count($fieldNames)) {
+				$userData['_cache'] = true;
+				return $userData;
+			}
+		} else {
+			$sessionData = array();
+		}
+
+		// check if we lack a login or if it has expired
+		if(empty($accessToken) || time() > $expires) {
+			$session->setFor($this, 'afterLoginURL', $this->wire('input')->httpUrl());
+			$page = $this->wire('pages')->get("template=$this->templateName");
+			if($page->id) $session->redirect($page->httpUrl());
+			return false;
+		}
+
+		// send request to Facebook
+		$fieldNamesCSV = implode(',', $fieldNames);
+		$userData = $http->getJSON('https://graph.facebook.com/me', true, array(
+			'access_token' => $accessToken,
+			'fields' => $fieldNamesCSV
+		));
+
+		$errors = array();
+		foreach($fieldNames as $fieldName) {
+			if(!isset($userData[$fieldName])) {
+				$userData[$fieldName] = null;
+				$errors[] = "Unknown field or missing permission for: $fieldName";
+			}
+		}
+
+		if(is_array($userData)) {
+			$sessionData = array_merge($sessionData, $userData);
+			$session->setFor($this, 'userData', $sessionData);
+		}
+
+		$userData['_cache'] = false;
+		$userData['_errors'] = $errors;
+
+		return $userData;
+	}
+
+	/**
+	 * Return all Facebook user data in an associative array
+	 * 
+	 * Same as getUserData() with the following exceptions:
+	 * 
+	 * 1. Excludes the debug info: '_cache' and '_errors' keys.
+	 * 2. There are 'picture_url' and/or 'cover_url' properties present, when 'picture' or 'cover' are present.
+	 * 
+	 * This method is more for the public API of this module. Use the getUserData()
+	 * method when trying to track down a problem, as the '_errors' key is an array
+	 * with any issues that turned up. 
+	 * 
+	 * @return array Associative array of all Facebook data or empty array on failure
+	 * 
+	 */
+	public function getAll() {
+		$userData = $this->getUserData();
+		unset($userData['_cache'], $userData['_errors']); 
+		if(isset($userData['picture'])) $userData['picture_url'] = $this->getImageURL('picture', $userData);
+		if(isset($userData['cover'])) $userData['cover_url'] = $this->getImageURL('cover', $userData);
+		return $this->prepData($userData);
+	}
+
+	/**
+	 * Get a Facebook image URL for “picture” or “cover” images
+	 * 
+	 * @param string $type Specify either “picture” or “cover” (default=picture)
+	 * @param array $userData Optional user data to find the image within 
+	 * @return string
+	 * 
+	 */
+	protected function getImageURL($type = 'picture', $userData = array()) {
+		if($type == 'picture') {
+			$picture = empty($userData) ? $this->get('picture') : $userData['picture'];
+			if(empty($picture) || empty($picture['data'])) return '';
+			return $picture['data']['url'];
+		} else if($type == 'cover') {
+			$cover = empty($userData) ? $this->get('cover') : $userData['cover'];
+			if(empty($cover) || empty($cover['source'])) return '';
+			return $cover['source'];
+		} else {
+			return '';
+		}
+	}
+	
+	/**
+	 * Log an error and throw a LoginFacebookException
+	 * 
+	 * @param string $msg
+	 * @throws LoginFacebookException
+	 * 
+	 */
+	protected function logException($msg) {
+		$this->log($msg); 
+		throw new LoginFacebookException($msg);
+	}
+
+	/**
+	 * Returns whether or not user is logged in AND connected to a Facebook account
+	 * 
+	 * - Returns boolean true if user was autenticated entirely by Facebook.
+	 * - Returns integer 1 if user logged into PW directly, before Facebook.
+	 * - Returns boolean false if no Facebook login is active (PW login may still be active). 
+	 * 
+	 * @return bool|int
+	 * 
+	 */
+	public function isLoggedIn() {
+		$user = $this->wire('user');
+		if(!$user->isLoggedin()) return false;
+		if(!$user->hasRole($this->roleName)) return false;
+		if(!$this->wire('session')->getFor($this, 'accessToken')) return false;
+		if(!$this->get('id')) return false;
+		// return boolean true if PW login was forced (i.e. user authenticated only by Facebook)
+		if($this->wire('session')->getFor($this, 'forceLogin')) return true;
+		// return integer 1 if user logged into and was authenticated by ProcessWire
+		return 1;
+	}
+
+	/**
+	 * Module configuration
+	 * 
+	 * @param InputfieldWrapper $inputfields
+	 * 
+	 */
+	public function getModuleConfigInputfields(InputfieldWrapper $inputfields) {
+		$this->installer()->check();
+		require_once(__DIR__ . '/config.php');
+		$cfg = new LoginFacebookConfigure($this);
+		$cfg->getInputfields($inputfields);
+	}
+
+	/**
+	 * Return array of all possible Facebook fields
+	 * 
+	 * @return array
+	 * 
+	 */
+	public function getFacebookFields() {
+		return $this->facebookFields;
+	}
+
+	/**
+	 * Module installation
+	 * 
+	 * @throws WireException
+	 * 
+	 */
+	public function install() {
+		$this->installer()->install();
+	}
+
+	/**
+	 * Uninstall module
+	 * 
+	 */
+	public function uninstall() {
+		$this->installer()->uninstall();
+	}
+
+	/**
+	 * Return installer
+	 * 
+	 * @return LoginFacebookInstaller
+	 * 
+	 */
+	protected function installer() {
+		require_once(__DIR__ . '/install.php');
+		return new LoginFacebookInstaller($this);
+	}
+}
+
+class LoginFacebookException extends WireException {}
